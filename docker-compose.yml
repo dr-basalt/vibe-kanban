@@ -1,0 +1,196 @@
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v3.0
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - TRAEFIK_ENTRYPOINTS_WEB_ADDRESS=:80
+      - TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS=:443
+      - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_TLSCHALLENGE=true
+      - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL=${ACME_EMAIL:-admin@${SERVICE_FQDN:-localhost}}
+      - TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_STORAGE=/letsencrypt/acme.json
+    volumes:
+      - traefik_letsencrypt:/letsencrypt
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.${SERVICE_FQDN:-localhost}`)"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.dashboard.service=api@internal"
+    command:
+      - --api.dashboard=true
+      - --api.insecure=false
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.tlschallenge=true
+      - --certificatesresolvers.letsencrypt.acme.email=${ACME_EMAIL:-admin@${SERVICE_FQDN:-localhost}}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+    depends_on:
+      - vibe-kanban
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-remote}
+      POSTGRES_USER: ${POSTGRES_USER:-remote}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: ["postgres", "-c", "wal_level=logical"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-remote} -d ${POSTGRES_DB:-remote}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    restart: unless-stopped
+    command: "azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --loose --skipApiVersionCheck"
+    volumes:
+      - azurite_data:/data
+    healthcheck:
+      test: nc 127.0.0.1 10000 -z
+      interval: 1s
+      retries: 30
+
+  azurite-init:
+    image: mcr.microsoft.com/azure-cli:latest
+    depends_on:
+      azurite:
+        condition: service_healthy
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        az storage container create --name issue-attachments 2>/dev/null || true
+        az storage cors add --services b --methods GET PUT POST DELETE OPTIONS --origins '*' --allowed-headers '*' --exposed-headers '*' --max-age 3600
+        echo "Azurite CORS configured"
+
+  electric:
+    image: electricsql/electric:1.3.3
+    restart: unless-stopped
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgresql://electric_sync:${ELECTRIC_ROLE_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-remote}?sslmode=disable
+      PG_PROXY_PORT: 65432
+      LOGICAL_PUBLISHER_HOST: electric
+      AUTH_MODE: insecure
+      ELECTRIC_INSECURE: true
+      ELECTRIC_MANUAL_TABLE_PUBLISHING: true
+      ELECTRIC_USAGE_REPORTING: false
+      ELECTRIC_FEATURE_FLAGS: allow_subqueries,tagged_subqueries
+    volumes:
+      - electric_data:/app/persistent
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vibe-kanban:
+        condition: service_healthy
+
+  vibe-kanban:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        POSTHOG_API_KEY: ${POSTHOG_API_KEY:-}
+        POSTHOG_API_ENDPOINT: ${POSTHOG_API_ENDPOINT:-}
+    restart: unless-stopped
+    environment:
+      # Core application settings
+      HOST: 0.0.0.0
+      PORT: 3000
+      
+      # Database configuration
+      SERVER_DATABASE_URL: postgres://${POSTGRES_USER:-remote}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-remote}
+      ELECTRIC_URL: http://electric:3000
+      ELECTRIC_ROLE_PASSWORD: ${ELECTRIC_ROLE_PASSWORD:-changeme}
+      
+      # Public URL configuration
+      SERVER_PUBLIC_BASE_URL: https://${SERVICE_FQDN:-localhost}
+      
+      # OAuth configuration - at least one provider must be configured
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:-}
+      GITHUB_OAUTH_CLIENT_SECRET: ${GITHUB_OAUTH_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      
+      # JWT secret for session management
+      VIBEKANBAN_REMOTE_JWT_SECRET: ${VIBEKANBAN_REMOTE_JWT_SECRET:-changeme-please-use-secure-random-string}
+      
+      # Optional email configuration for invitations
+      LOOPS_EMAIL_API_KEY: ${LOOPS_EMAIL_API_KEY:-}
+      
+      # GitHub App configuration (optional)
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_WEBHOOK_SECRET: ${GITHUB_APP_WEBHOOK_SECRET:-}
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-}
+      
+      # Stripe configuration (optional for billing)
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_TEAM_SEAT_PRICE_ID: ${STRIPE_TEAM_SEAT_PRICE_ID:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_FREE_SEAT_LIMIT: ${STRIPE_FREE_SEAT_LIMIT:-1}
+      
+      # Azure Blob Storage configuration (using Azurite for local dev)
+      AZURE_STORAGE_ACCOUNT_NAME: ${AZURE_STORAGE_ACCOUNT_NAME:-devstoreaccount1}
+      AZURE_STORAGE_ACCOUNT_KEY: ${AZURE_STORAGE_ACCOUNT_KEY:-Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==}
+      AZURE_STORAGE_CONTAINER_NAME: ${AZURE_STORAGE_CONTAINER_NAME:-issue-attachments}
+      AZURE_STORAGE_ENDPOINT_URL: ${AZURE_STORAGE_ENDPOINT_URL:-http://azurite:10000/devstoreaccount1}
+      AZURE_STORAGE_PUBLIC_ENDPOINT_URL: https://${SERVICE_FQDN:-localhost}/storage
+      
+      # Cloudflare R2 configuration (optional alternative to Azure)
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      R2_REVIEW_ENDPOINT: ${R2_REVIEW_ENDPOINT:-}
+      R2_REVIEW_BUCKET: ${R2_REVIEW_BUCKET:-}
+      REVIEW_WORKER_BASE_URL: ${REVIEW_WORKER_BASE_URL:-}
+      
+      # Logging configuration
+      RUST_LOG: ${RUST_LOG:-info,remote=info}
+      
+    depends_on:
+      postgres:
+        condition: service_healthy
+      azurite-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vibe-kanban.rule=Host(`${SERVICE_FQDN:-localhost}`)"
+      - "traefik.http.routers.vibe-kanban.tls=true"
+      - "traefik.http.routers.vibe-kanban.tls.certresolver=letsencrypt"
+      - "traefik.http.services.vibe-kanban.loadbalancer.server.port=3000"
+      # Storage proxy for Azurite
+      - "traefik.http.routers.storage.rule=Host(`${SERVICE_FQDN:-localhost}`) && PathPrefix(`/storage`)"
+      - "traefik.http.routers.storage.tls=true"
+      - "traefik.http.routers.storage.tls.certresolver=letsencrypt"
+      - "traefik.http.middlewares.storage-strip.stripprefix.prefixes=/storage"
+      - "traefik.http.routers.storage.middlewares=storage-strip"
+      - "traefik.http.services.storage.loadbalancer.server.port=10000"
+
+volumes:
+  postgres_data:
+  electric_data:
+  azurite_data:
+  traefik_letsencrypt:
